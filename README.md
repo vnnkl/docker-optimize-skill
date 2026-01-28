@@ -6,13 +6,13 @@ A [Claude Code](https://claude.ai/claude-code) skill that audits and optimizes D
 
 ```bash
 # Clone to your Claude skills directory
-git clone https://github.com/YOUR_USERNAME/docker-optimize-skill ~/.claude/skills/docker-optimize
+git clone https://github.com/vnnkl/docker-optimize-skill ~/.claude/skills/docker-optimize
 ```
 
 Or add as a symlink:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/docker-optimize-skill ~/Code/docker-optimize-skill
+git clone https://github.com/vnnkl/docker-optimize-skill ~/Code/docker-optimize-skill
 ln -s ~/Code/docker-optimize-skill ~/.claude/skills/docker-optimize
 ```
 
