@@ -1,28 +1,240 @@
 ---
 name: docker-optimize
-description: "Audit and optimize Dockerfiles for size, security, build speed, and best practices. Triggers on: optimize dockerfile, audit docker, fix dockerfile, docker best practices."
+description: "Audit and optimize Dockerfiles and docker-compose files for size, security, build speed, and best practices. Triggers on: optimize dockerfile, audit docker, fix dockerfile, docker best practices, docker compose security."
 ---
 
 # Docker Optimization
 
-Audit Dockerfiles for common mistakes and apply battle-tested fixes. Based on patterns from hundreds of real-world Docker deployments.
+Audit Dockerfiles and docker-compose files for common mistakes and security vulnerabilities. Based on patterns from hundreds of real-world Docker deployments and CWE-mapped security rules.
 
 ---
 
 ## The Job
 
-1. Read the Dockerfile(s) in the project
-2. Audit against the 10 critical mistakes checklist
-3. Generate a prioritized findings report
-4. Apply fixes (with user confirmation)
+1. Find Dockerfile(s) and docker-compose files in the project
+2. Audit against security checklist (Critical → High → Medium)
+3. Audit against optimization checklist
+4. Generate prioritized findings report with CWE references
+5. Apply fixes (with user confirmation)
 
 ---
 
-## Audit Checklist
+## Part 1: Dockerfile Security Audit
 
-Run through each check. Score: 🔴 Critical | 🟡 Warning | 🟢 Good
+Score: 🔴 Critical | 🟠 High | 🟡 Medium | 🟢 Good
 
-### 1. Base Image Tags
+### SEC-001: Docker Socket Exposure
+**Severity**: 🔴 Critical | **CWE**: CWE-250
+```dockerfile
+# 🔴 CRITICAL: Full host compromise possible
+VOLUME ["/var/run/docker.sock"]
+
+# Also check for:
+-v /var/run/docker.sock:/var/run/docker.sock
+```
+**Impact**: Grants full control over host Docker daemon. Complete container escape.
+**Fix**: Never mount Docker socket. Use Docker API with authentication if needed.
+
+### SEC-002: Running as Root
+**Severity**: 🟠 High | **CWE**: CWE-250
+```dockerfile
+# 🟠 BAD: No USER instruction
+CMD ["node", "server.js"]
+
+# 🟢 GOOD: Explicit non-root user
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+CMD ["node", "server.js"]
+```
+**Check**: No `USER` instruction before final `CMD`/`ENTRYPOINT`
+
+### SEC-003: Secrets in ENV/ARG
+**Severity**: 🔴 Critical | **CWE**: CWE-538
+```dockerfile
+# 🔴 CRITICAL: Visible in docker history forever
+ENV AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+ARG DATABASE_PASSWORD=secret123
+
+# 🟢 GOOD: BuildKit secrets (never persisted)
+RUN --mount=type=secret,id=db_password,target=/run/secrets/db_password \
+    cat /run/secrets/db_password | some-command
+```
+**Check**: ENV/ARG containing: key, secret, password, token, credential, api_key
+**Note**: ARG values visible in `docker history` even without default values
+
+### SEC-004: Sudo in Dockerfile
+**Severity**: 🟡 Medium | **CWE**: CWE-250
+```dockerfile
+# 🟡 BAD: Unnecessary privilege escalation
+RUN sudo apt-get install -y curl
+
+# 🟢 GOOD: Run as root before USER, then drop privileges
+RUN apt-get install -y curl
+USER appuser
+```
+**Fix**: Run privileged commands before `USER` instruction, not with sudo
+
+### SEC-005: ADD vs COPY
+**Severity**: 🟡 Medium
+```dockerfile
+# 🟡 BAD: ADD has hidden behaviors (auto-extract, remote fetch)
+ADD https://example.com/file.tar.gz /app/
+ADD archive.tar.gz /app/
+
+# 🟢 GOOD: COPY is explicit and predictable
+COPY archive.tar.gz /app/
+RUN tar -xzf /app/archive.tar.gz
+```
+**Check**: Any `ADD` instruction → prefer `COPY` unless extraction needed
+
+### SEC-006: Shell Form vs Exec Form
+**Severity**: 🟡 Medium
+```dockerfile
+# 🟡 BAD: Shell form - no signal handling, extra shell process
+CMD npm start
+ENTRYPOINT /app/start.sh
+
+# 🟢 GOOD: Exec form - proper PID 1, signal handling
+CMD ["npm", "start"]
+ENTRYPOINT ["/app/start.sh"]
+```
+**Impact**: Shell form prevents proper SIGTERM handling, graceful shutdown fails
+
+### SEC-007: Missing pipefail
+**Severity**: 🟡 Medium
+```dockerfile
+# 🟡 BAD: Pipe failure ignored
+RUN curl -s https://example.com/script.sh | bash
+
+# 🟢 GOOD: Fail on any pipe component failure
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+RUN curl -s https://example.com/script.sh | bash
+```
+**Check**: RUN with pipes (`|`) without `set -o pipefail` or SHELL override
+
+---
+
+## Part 2: Docker Compose Security Audit
+
+### COMPOSE-SEC-001: Privileged Mode
+**Severity**: 🔴 Critical | **CWE**: CWE-250
+```yaml
+# 🔴 CRITICAL: Disables ALL container isolation
+services:
+  app:
+    privileged: true
+```
+**Impact**: Access to all devices, can load kernel modules, complete host escape
+**Fix**: Remove `privileged: true`. Use specific capabilities if needed.
+
+### COMPOSE-SEC-002: Docker Socket Mount
+**Severity**: 🔴 Critical | **CWE**: CWE-250
+```yaml
+# 🔴 CRITICAL: Full Docker daemon access
+services:
+  app:
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+```
+**Fix**: Remove socket mount. Use Docker API with TLS authentication.
+
+### COMPOSE-SEC-003: Seccomp Disabled
+**Severity**: 🟠 High | **CWE**: CWE-284
+```yaml
+# 🟠 BAD: Removes syscall filtering
+services:
+  app:
+    security_opt:
+      - seccomp:unconfined
+```
+**Fix**: Remove or use custom seccomp profile: `seccomp:./custom-seccomp.json`
+
+### COMPOSE-SEC-004: Host Network Mode
+**Severity**: 🟠 High | **CWE**: CWE-250
+```yaml
+# 🟠 BAD: Bypasses network isolation
+services:
+  app:
+    network_mode: host
+```
+**Impact**: Container shares host network stack, can access all host ports
+**Fix**: Use bridge network with explicit port mappings
+
+### COMPOSE-SEC-005: Dangerous Capabilities
+**Severity**: 🟠 High | **CWE**: CWE-250
+```yaml
+# 🟠 BAD: Overly permissive capabilities
+services:
+  app:
+    cap_add:
+      - SYS_ADMIN    # Near-root powers
+      - NET_ADMIN    # Network manipulation
+      - SYS_PTRACE   # Process debugging
+      - ALL          # Everything
+
+# 🟢 GOOD: Drop all, add only what's needed
+services:
+  app:
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE  # Only if binding <1024
+```
+
+### COMPOSE-SEC-006: Host PID/IPC Namespace
+**Severity**: 🟠 High | **CWE**: CWE-250
+```yaml
+# 🟠 BAD: Shares host process/IPC namespace
+services:
+  app:
+    pid: host
+    ipc: host
+```
+**Impact**: Can see/signal all host processes, access shared memory
+**Fix**: Remove `pid: host` and `ipc: host`
+
+### COMPOSE-SEC-007: Missing no-new-privileges
+**Severity**: 🟡 Medium | **CWE**: CWE-732
+```yaml
+# 🟢 GOOD: Prevent privilege escalation
+services:
+  app:
+    security_opt:
+      - no-new-privileges:true
+```
+**Check**: Missing `no-new-privileges:true` in security_opt
+
+### COMPOSE-SEC-008: SELinux/AppArmor Disabled
+**Severity**: 🟡 Medium | **CWE**: CWE-732
+```yaml
+# 🟡 BAD: Disables mandatory access controls
+services:
+  app:
+    security_opt:
+      - label:disable
+      - apparmor:unconfined
+```
+
+### COMPOSE-SEC-009: Writable Root Filesystem
+**Severity**: 🟡 Medium
+```yaml
+# 🟢 GOOD: Read-only root, explicit writable paths
+services:
+  app:
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/run
+    volumes:
+      - app-data:/app/data
+```
+**Check**: Missing `read_only: true`
+
+---
+
+## Part 3: Optimization Checklist
+
+### OPT-001: Base Image Tags
 ```dockerfile
 # 🔴 BAD: Moving target
 FROM node:latest
@@ -30,333 +242,282 @@ FROM node:latest
 # 🟢 GOOD: Pinned version
 FROM node:20.11.1-alpine3.19
 ```
-**Check**: Any `FROM` with `:latest` or no tag → 🔴 Critical
 
-### 2. Image Size
+### OPT-002: Image Size
 ```dockerfile
-# 🔴 BAD: Full OS (1.8GB+)
+# 🟡 BAD: Full OS (1.8GB+)
 FROM ubuntu:22.04
-RUN apt-get update && apt-get install -y nodejs npm
 
-# 🟢 GOOD: Minimal base (180MB)
-FROM node:20.11-alpine
+# 🟢 GOOD: Minimal base
+FROM node:20-alpine      # ~180MB
+FROM python:3.12-slim    # ~150MB
+FROM gcr.io/distroless/static  # ~2MB
 ```
-**Check**: Using `ubuntu`, `debian` (non-slim), full `node`/`python` → 🟡 Warning
-**Recommend**: alpine or slim variants
 
-### 3. Layer Cache Optimization
+### OPT-003: Layer Cache
 ```dockerfile
-# 🔴 BAD: Cache busted on every code change
+# 🔴 BAD: Cache busted on every change
 COPY . .
 RUN npm install
 
-# 🟢 GOOD: Dependencies cached separately
-COPY package.json package-lock.json ./
+# 🟢 GOOD: Dependencies cached
+COPY package*.json ./
 RUN npm ci
 COPY . .
 ```
-**Check**: `COPY . .` before dependency install → 🔴 Critical
 
-### 4. Non-Root User
+### OPT-004: Package Manager Flags
 ```dockerfile
-# 🔴 BAD: Running as root
-CMD ["node", "server.js"]
+# 🟡 BAD: Missing optimization flags
+RUN apt-get update && apt-get install -y curl
+RUN apk add curl
+RUN pip install requests
 
-# 🟢 GOOD: Dedicated user
-RUN addgroup -S appgroup && adduser -S appuser -G appgroup
-USER appuser
-CMD ["node", "server.js"]
+# 🟢 GOOD: With cache/size optimization
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache curl
+RUN pip install --no-cache-dir requests
 ```
-**Check**: No `USER` instruction before final `CMD` → 🟡 Warning
-**Note**: Some base images have built-in users (node:node, bun:bun)
 
-### 5. Secrets Exposure
+### OPT-005: apt-get upgrade
 ```dockerfile
-# 🔴 CRITICAL: Secrets baked in image
-ENV AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
-ARG DATABASE_PASSWORD=secret123
-```
-**Check**: ENV/ARG containing key, secret, password, token, credential → 🔴 Critical
-**Fix**: Use runtime env vars or BuildKit secrets
+# 🟡 BAD: Non-reproducible, adds bloat
+RUN apt-get update && apt-get upgrade -y
 
-### 6. .dockerignore
-**Check**: No `.dockerignore` file exists → 🟡 Warning
-**Minimum .dockerignore**:
+# 🟢 GOOD: Pin base image version instead
+FROM debian:12.4-slim
 ```
-.git
-node_modules
-npm-debug.log
-.env
-.env.*
-coverage
-*.md
-.vscode
-.idea
-__pycache__
-*.pyc
-.pytest_cache
-```
+**Why**: Upgrades are unpredictable. Pin your base image for reproducibility.
 
-### 7. Health Checks
+### OPT-006: Multi-Stage Builds
 ```dockerfile
-# 🟢 GOOD: Meaningful health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-  CMD curl -f http://localhost:3000/health || exit 1
-```
-**Check**: No `HEALTHCHECK` instruction → 🟡 Warning (unless Kubernetes)
-
-### 8. Multi-Stage Builds
-```dockerfile
-# 🟢 GOOD: Separate build and runtime
+# 🟢 GOOD: Build tools don't ship to production
 FROM node:20-alpine AS builder
 RUN npm ci && npm run build
 
 FROM node:20-alpine AS production
 COPY --from=builder /app/dist ./dist
 ```
-**Check**: Single-stage with build tools in final image → 🟡 Warning
 
-### 9. Layer Optimization
+### OPT-007: .dockerignore
+**Check**: No `.dockerignore` file
+**Impact**: Bloated context, slower builds, potential secret leakage
+
+### OPT-008: Health Checks
 ```dockerfile
-# 🔴 BAD: Cleanup in separate layer (doesn't save space)
-RUN apt-get update
-RUN apt-get install -y curl wget
-RUN apt-get clean
-
-# 🟢 GOOD: Single layer with cleanup
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl wget && \
-    rm -rf /var/lib/apt/lists/*
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD curl -f http://localhost:3000/health || exit 1
 ```
-**Check**: Multiple consecutive `RUN apt-get` or cleanup in separate `RUN` → 🟡 Warning
-
-### 10. Base Image Currency
-**Check**: Base image older than 6 months → 🟡 Warning
-**Action**: Run `docker scout cves <image>` or `trivy image <image>`
 
 ---
 
 ## Report Format
 
 ```markdown
-# Docker Audit Report
+# Docker Security & Optimization Audit
 
 ## Summary
-- 🔴 Critical: X issues
-- 🟡 Warning: X issues
+- 🔴 Critical: X issues (container escape risk)
+- 🟠 High: X issues (privilege escalation risk)
+- 🟡 Medium: X issues (best practice violations)
 - 🟢 Good: X checks passed
 
-## Findings
+## Security Findings
 
-### 🔴 [Critical] Unpinned Base Image
+### 🔴 [CRITICAL] Docker Socket Exposed (SEC-001)
+**File**: docker-compose.yml:12
+**CWE**: CWE-250 (Execution with Unnecessary Privileges)
+**Current**: `- /var/run/docker.sock:/var/run/docker.sock`
+**Impact**: Complete host compromise possible
+**Fix**: Remove socket mount, use Docker API with TLS
+
+### 🟠 [HIGH] Privileged Container (COMPOSE-SEC-001)
+**File**: docker-compose.yml:8
+**CWE**: CWE-250
+**Fix**: Remove `privileged: true`, use specific capabilities
+
+## Optimization Findings
+
+### 🟡 [MEDIUM] Unpinned Base Image (OPT-001)
 **File**: Dockerfile:1
 **Current**: `FROM node:latest`
 **Fix**: `FROM node:20.11.1-alpine3.19`
-**Impact**: Non-reproducible builds, surprise breakages
-
-### 🟡 [Warning] Missing .dockerignore
-**Impact**: Bloated build context, slower builds
-**Fix**: Create .dockerignore with standard exclusions
 
 ## Recommended Actions (Priority Order)
-1. Pin base image versions
-2. Add .dockerignore
-3. Reorder COPY for cache optimization
-4. Add non-root user
+1. 🔴 Remove Docker socket mount
+2. 🔴 Remove hardcoded secrets
+3. 🟠 Disable privileged mode
+4. 🟠 Add non-root user
+5. 🟡 Pin base image versions
 ```
 
 ---
 
-## Quick Fixes
+## Secure docker-compose.yml Template
 
-### Convert to Multi-Stage (Node.js)
+```yaml
+version: "3.8"
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: myapp:${VERSION:-latest}
+
+    # Security hardening
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE  # Only if needed
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          memory: 256M
+
+    # Networking
+    networks:
+      - app-network
+    ports:
+      - "3000:3000"
+
+    # Writable paths only where needed
+    tmpfs:
+      - /tmp:size=100M
+    volumes:
+      - app-data:/app/data:rw
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+    # Environment (no secrets here)
+    environment:
+      - NODE_ENV=production
+    env_file:
+      - .env  # Secrets in .env, not committed
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  app-data:
+```
+
+---
+
+## Quick Reference: Dockerfile Template
+
 ```dockerfile
-# Build stage
-FROM node:20-alpine AS builder
+# syntax=docker/dockerfile:1
+FROM node:20.11.1-alpine AS builder
+
 WORKDIR /app
+
+# Dependencies first (cache optimization)
 COPY package*.json ./
 RUN npm ci
+
+# Source code
 COPY . .
 RUN npm run build
 
 # Production stage
-FROM node:20-alpine AS production
+FROM node:20.11.1-alpine AS production
+
 WORKDIR /app
 ENV NODE_ENV=production
+
+# Non-root user
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+
+# Production dependencies only
+COPY package*.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+
+# Built artifacts
 COPY --from=builder --chown=appuser:appgroup /app/dist ./dist
-COPY --from=builder --chown=appuser:appgroup /app/node_modules ./node_modules
+
 USER appuser
+
 EXPOSE 3000
-HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://localhost:3000/health || exit 1
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD wget -qO- http://localhost:3000/health || exit 1
+
 CMD ["node", "dist/index.js"]
-```
-
-### Convert to Multi-Stage (Python)
-```dockerfile
-# Build stage
-FROM python:3.12-slim AS builder
-WORKDIR /app
-RUN pip install --no-cache-dir poetry
-COPY pyproject.toml poetry.lock ./
-RUN poetry export -f requirements.txt --output requirements.txt
-RUN pip install --no-cache-dir --target=/app/deps -r requirements.txt
-COPY . .
-
-# Production stage
-FROM python:3.12-slim AS production
-WORKDIR /app
-RUN useradd -r -s /bin/false appuser
-COPY --from=builder --chown=appuser:appuser /app/deps /app/deps
-COPY --from=builder --chown=appuser:appuser /app/src ./src
-ENV PYTHONPATH=/app/deps
-USER appuser
-EXPOSE 8000
-HEALTHCHECK --interval=30s --timeout=3s CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
-CMD ["python", "src/main.py"]
-```
-
-### Convert to Multi-Stage (Go)
-```dockerfile
-# Build stage
-FROM golang:1.22-alpine AS builder
-WORKDIR /app
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /app/server ./cmd/server
-
-# Production stage (distroless)
-FROM gcr.io/distroless/static-debian12 AS production
-COPY --from=builder /app/server /server
-USER nonroot:nonroot
-EXPOSE 8080
-ENTRYPOINT ["/server"]
-```
-
-### Convert to Bun
-```dockerfile
-FROM oven/bun:1 AS builder
-WORKDIR /app
-COPY package.json bun.lock ./
-RUN bun install --frozen-lockfile
-COPY . .
-RUN bun run build
-
-FROM oven/bun:1-slim AS production
-WORKDIR /app
-ENV NODE_ENV=production
-COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/node_modules ./node_modules
-USER bun
-EXPOSE 3000
-CMD ["bun", "run", "dist/index.js"]
-```
-
----
-
-## Standard .dockerignore
-
-```
-# Git
-.git
-.gitignore
-
-# Dependencies (reinstalled in container)
-node_modules
-vendor
-.venv
-__pycache__
-*.pyc
-
-# Build artifacts
-dist
-build
-coverage
-.nyc_output
-
-# IDE/Editor
-.vscode
-.idea
-*.swp
-*.swo
-
-# Environment/Secrets
-.env
-.env.*
-*.pem
-*.key
-
-# Documentation
-*.md
-docs
-LICENSE
-
-# Tests (unless needed)
-tests
-__tests__
-*.test.js
-*.spec.js
-
-# Docker
-Dockerfile*
-docker-compose*
-.dockerignore
-
-# CI/CD
-.github
-.gitlab-ci.yml
-.circleci
 ```
 
 ---
 
 ## Workflow
 
-1. **Find Dockerfiles**
+1. **Find files**
    ```bash
-   find . -name "Dockerfile*" -o -name "*.dockerfile"
+   find . -name "Dockerfile*" -o -name "docker-compose*.yml" -o -name "compose*.yml"
    ```
 
-2. **Run Audit**
-   - Read each Dockerfile
-   - Check against 10-point checklist
-   - Generate findings report
+2. **Run security audit first** (Critical → High → Medium)
 
-3. **Measure Current State**
+3. **Run optimization audit**
+
+4. **Scan for CVEs**
    ```bash
-   docker build -t audit-before . && docker images audit-before
-   docker history audit-before
+   docker scout cves myapp:latest
+   trivy image myapp:latest
    ```
 
-4. **Apply Fixes** (with confirmation)
+5. **Apply fixes** (with user confirmation)
 
-5. **Verify Improvement**
+6. **Verify**
    ```bash
-   docker build -t audit-after . && docker images audit-after
-   time docker build --no-cache -t timing-test .
+   docker build -t audit-after .
+   docker images audit-after
+   docker history audit-after
    ```
 
 ---
 
 ## Important Rules
 
-- **ALWAYS** pin base image versions (major.minor.patch)
-- **ALWAYS** use minimal base images (alpine/slim/distroless)
-- **ALWAYS** copy dependency files before source code
-- **ALWAYS** run as non-root in production
-- **NEVER** put secrets in Dockerfile (ENV, ARG, or inline)
-- **NEVER** use `COPY . .` before installing dependencies
-- **NEVER** skip .dockerignore
+### Security (Never Violate)
+- **NEVER** mount Docker socket
+- **NEVER** use `privileged: true`
+- **NEVER** put secrets in Dockerfile/docker-compose
+- **NEVER** run as root in production
+- **NEVER** disable seccomp/AppArmor without justification
+
+### Optimization (Best Practice)
+- **ALWAYS** pin base image versions
+- **ALWAYS** use minimal base images
+- **ALWAYS** copy dependency files before source
+- **ALWAYS** use exec form for CMD/ENTRYPOINT
+- **ALWAYS** include .dockerignore
+- **ALWAYS** use `--no-install-recommends` / `--no-cache` / `--no-cache-dir`
 
 ---
 
 ## Size Targets
 
-| Stack | Target Size | Base Image |
-|-------|-------------|------------|
+| Stack | Target | Base Image |
+|-------|--------|------------|
 | Node.js | < 200MB | node:XX-alpine |
 | Python | < 300MB | python:XX-slim |
 | Go | < 20MB | distroless/static |
 | Rust | < 20MB | distroless/cc |
 | Java | < 300MB | eclipse-temurin:XX-jre-alpine |
+| Bun | < 200MB | oven/bun:XX-slim |
