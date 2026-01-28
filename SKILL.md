@@ -5,17 +5,18 @@ description: "Audit and optimize Dockerfiles and docker-compose files for size, 
 
 # Docker Optimization
 
-Audit Dockerfiles and docker-compose files for common mistakes and security vulnerabilities. Based on patterns from hundreds of real-world Docker deployments and CWE-mapped security rules.
+Audit Dockerfiles and docker-compose files for common mistakes and security vulnerabilities. Based on patterns from hundreds of real-world Docker deployments, CWE-mapped security rules, and industry best practices.
 
 ---
 
 ## The Job
 
 1. Find Dockerfile(s) and docker-compose files in the project
-2. Audit against security checklist (Critical → High → Medium)
-3. Audit against optimization checklist
-4. Generate prioritized findings report with CWE references
-5. Apply fixes (with user confirmation)
+2. Run Hadolint for static analysis (if available)
+3. Audit against security checklist (Critical → High → Medium)
+4. Audit against optimization checklist
+5. Generate prioritized findings report with CWE references
+6. Apply fixes (with user confirmation)
 
 ---
 
@@ -33,20 +34,21 @@ VOLUME ["/var/run/docker.sock"]
 -v /var/run/docker.sock:/var/run/docker.sock
 ```
 **Impact**: Grants full control over host Docker daemon. Complete container escape.
-**Fix**: Never mount Docker socket. Use Docker API with authentication if needed.
+**Fix**: Never mount Docker socket. Use Docker API with TLS authentication if needed.
 
 ### SEC-002: Running as Root
 **Severity**: 🟠 High | **CWE**: CWE-250
 ```dockerfile
-# 🟠 BAD: No USER instruction
+# 🟠 BAD: No USER instruction (58% of images run as root!)
 CMD ["node", "server.js"]
 
 # 🟢 GOOD: Explicit non-root user
-RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
-USER appuser
+RUN adduser -D myuser && chown -R myuser /app
+USER myuser
 CMD ["node", "server.js"]
 ```
 **Check**: No `USER` instruction before final `CMD`/`ENTRYPOINT`
+**Note**: Some orchestrators (OpenShift) block root containers by default
 
 ### SEC-003: Secrets in ENV/ARG
 **Severity**: 🔴 Critical | **CWE**: CWE-538
@@ -60,6 +62,7 @@ RUN --mount=type=secret,id=db_password,target=/run/secrets/db_password \
     cat /run/secrets/db_password | some-command
 ```
 **Check**: ENV/ARG containing: key, secret, password, token, credential, api_key
+**Warning**: ENV vars visible to child processes, logs, and linked containers
 **Note**: ARG values visible in `docker history` even without default values
 
 ### SEC-004: Sudo in Dockerfile
@@ -83,7 +86,7 @@ ADD archive.tar.gz /app/
 
 # 🟢 GOOD: COPY is explicit and predictable
 COPY archive.tar.gz /app/
-RUN tar -xzf /app/archive.tar.gz
+RUN tar -xzf /app/archive.tar.gz && rm /app/archive.tar.gz
 ```
 **Check**: Any `ADD` instruction → prefer `COPY` unless extraction needed
 
@@ -111,6 +114,46 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN curl -s https://example.com/script.sh | bash
 ```
 **Check**: RUN with pipes (`|`) without `set -o pipefail` or SHELL override
+
+### SEC-008: Hardcoded UID
+**Severity**: 🟡 Medium
+```dockerfile
+# 🟡 BAD: Hardcoded UID breaks some orchestrators
+RUN useradd -u 1000 appuser
+RUN chown -R 1000:1000 /app
+
+# 🟢 GOOD: Flexible UID, write to /tmp for portability
+RUN adduser -D appuser
+USER appuser
+WORKDIR /tmp/app-workspace
+```
+**Why**: OpenShift and some Kubernetes configs use random UIDs. Don't assume UID 1000.
+
+### SEC-009: Writable Binaries
+**Severity**: 🟡 Medium
+```dockerfile
+# 🟡 BAD: App user owns executable (can be modified at runtime)
+COPY --chown=appuser:appuser myapp /app/myapp
+
+# 🟢 GOOD: Root owns binary, non-writable (immutable)
+COPY myapp /app/myapp
+RUN chmod 555 /app/myapp
+USER appuser
+```
+**Why**: Prevents runtime code modification attacks. Enforces container immutability.
+
+### SEC-010: Secrets "Deleted" in Later Layer
+**Severity**: 🔴 Critical
+```dockerfile
+# 🔴 CRITICAL: Secret still accessible in earlier layer!
+COPY credentials.json /app/
+RUN configure-app.sh && rm credentials.json
+
+# 🟢 GOOD: Use BuildKit secrets
+RUN --mount=type=secret,id=creds,target=/tmp/creds \
+    configure-app.sh /tmp/creds
+```
+**Impact**: Files removed in later layers can still be extracted from image history.
 
 ---
 
@@ -236,35 +279,41 @@ services:
 
 ### OPT-001: Base Image Tags
 ```dockerfile
-# 🔴 BAD: Moving target
+# 🔴 BAD: Moving target, "your build can suddenly break"
 FROM node:latest
 
-# 🟢 GOOD: Pinned version
+# 🟡 BETTER: Pinned version
 FROM node:20.11.1-alpine3.19
+
+# 🟢 BEST: Immutable digest (prevents tag mutation attacks)
+FROM node@sha256:abc123...
 ```
+**Why**: Tags can change. Digests are immutable. Use tags for dev, digests for prod.
 
 ### OPT-002: Image Size
 ```dockerfile
-# 🟡 BAD: Full OS (1.8GB+)
+# 🟡 BAD: Full OS - "more than 100 vulnerabilities" (Sysdig)
 FROM ubuntu:22.04
 
 # 🟢 GOOD: Minimal base
 FROM node:20-alpine      # ~180MB
 FROM python:3.12-slim    # ~150MB
-FROM gcr.io/distroless/static  # ~2MB
+FROM gcr.io/distroless/static  # ~2MB (best for Go/Rust)
 ```
+**Prefer**: distroless > alpine > slim > full
 
-### OPT-003: Layer Cache
+### OPT-003: Layer Cache Order
 ```dockerfile
-# 🔴 BAD: Cache busted on every change
+# 🔴 BAD: Cache busted on every code change
 COPY . .
 RUN npm install
 
-# 🟢 GOOD: Dependencies cached
+# 🟢 GOOD: Dependencies cached separately
 COPY package*.json ./
 RUN npm ci
 COPY . .
 ```
+**Rule**: Order by change frequency. Rarely changed → frequently changed.
 
 ### OPT-004: Package Manager Flags
 ```dockerfile
@@ -282,7 +331,7 @@ RUN pip install --no-cache-dir requests
 
 ### OPT-005: apt-get upgrade
 ```dockerfile
-# 🟡 BAD: Non-reproducible, adds bloat
+# 🟡 BAD: Non-reproducible, breaks immutability
 RUN apt-get update && apt-get upgrade -y
 
 # 🟢 GOOD: Pin base image version instead
@@ -303,12 +352,76 @@ COPY --from=builder /app/dist ./dist
 ### OPT-007: .dockerignore
 **Check**: No `.dockerignore` file
 **Impact**: Bloated context, slower builds, potential secret leakage
+**Risk**: Build context can accidentally include credentials, backups, lock files
 
 ### OPT-008: Health Checks
 ```dockerfile
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
   CMD curl -f http://localhost:3000/health || exit 1
 ```
+
+### OPT-009: ENV/EXPOSE Placement
+```dockerfile
+# 🟡 BAD: ENV early breaks cache for everything after
+FROM node:20-alpine
+ENV APP_VERSION=1.0.0
+COPY . .
+RUN npm ci
+
+# 🟢 GOOD: ENV/EXPOSE at end (cache optimization)
+FROM node:20-alpine
+COPY package*.json ./
+RUN npm ci
+COPY . .
+ENV APP_VERSION=1.0.0
+EXPOSE 3000
+```
+**Why**: Changing ENV invalidates all subsequent layers. Put at end unless needed for build.
+
+### OPT-010: Multiple FROM Pitfall
+```dockerfile
+# ⚠️ WARNING: Only LAST FROM is used (unless multi-stage)
+FROM ubuntu:22.04
+FROM node:20-alpine  # This is the actual base image!
+```
+**Check**: Multiple `FROM` without stage names (`AS builder`) may be a mistake
+
+### OPT-011: VOLUME Timing
+```dockerfile
+# 🟡 BAD: Files written before VOLUME are lost at runtime
+WORKDIR /app/data
+RUN echo "config" > settings.json
+VOLUME /app/data  # settings.json won't persist!
+
+# 🟢 GOOD: Write files after container starts, or use COPY
+COPY settings.json /app/data/
+VOLUME /app/data
+```
+**Why**: VOLUME is runtime, not build time. Pre-existing files are shadowed.
+
+### OPT-012: Layer Consolidation
+```dockerfile
+# 🟡 BAD: 4 layers, cleanup doesn't save space
+RUN apt-get update
+RUN apt-get install -y curl
+RUN apt-get install -y wget
+RUN apt-get clean
+
+# 🟢 GOOD: 1 layer, cleanup actually works
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl wget && \
+    rm -rf /var/lib/apt/lists/*
+```
+
+### OPT-013: OCI Labels
+```dockerfile
+# 🟢 GOOD: Metadata for lifecycle management
+LABEL org.opencontainers.image.title="MyApp" \
+      org.opencontainers.image.version="1.0.0" \
+      org.opencontainers.image.vendor="MyCompany" \
+      org.opencontainers.image.source="https://github.com/myorg/myapp"
+```
+**Why**: Helps with image inventory, vulnerability tracking, and compliance.
 
 ---
 
@@ -332,10 +445,11 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
 **Impact**: Complete host compromise possible
 **Fix**: Remove socket mount, use Docker API with TLS
 
-### 🟠 [HIGH] Privileged Container (COMPOSE-SEC-001)
-**File**: docker-compose.yml:8
-**CWE**: CWE-250
-**Fix**: Remove `privileged: true`, use specific capabilities
+### 🔴 [CRITICAL] Secret Persisted in Layer (SEC-010)
+**File**: Dockerfile:15-16
+**Current**: `COPY secrets.json ... && rm secrets.json`
+**Impact**: Secret extractable from image layers
+**Fix**: Use BuildKit --mount=type=secret
 
 ## Optimization Findings
 
@@ -343,10 +457,11 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
 **File**: Dockerfile:1
 **Current**: `FROM node:latest`
 **Fix**: `FROM node:20.11.1-alpine3.19`
+**Best**: `FROM node@sha256:...` (immutable digest)
 
 ## Recommended Actions (Priority Order)
 1. 🔴 Remove Docker socket mount
-2. 🔴 Remove hardcoded secrets
+2. 🔴 Fix secret in layer (use BuildKit)
 3. 🟠 Disable privileged mode
 4. 🟠 Add non-root user
 5. 🟡 Pin base image versions
@@ -440,20 +555,26 @@ RUN npm run build
 FROM node:20.11.1-alpine AS production
 
 WORKDIR /app
-ENV NODE_ENV=production
 
-# Non-root user
+# Non-root user (flexible UID)
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 
 # Production dependencies only
 COPY package*.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
-# Built artifacts
-COPY --from=builder --chown=appuser:appgroup /app/dist ./dist
+# Built artifacts (root-owned, non-writable for security)
+COPY --from=builder /app/dist ./dist
+RUN chown -R appuser:appgroup /app && chmod -R 555 /app/dist
 
 USER appuser
 
+# Metadata
+LABEL org.opencontainers.image.title="MyApp" \
+      org.opencontainers.image.version="1.0.0"
+
+# Runtime config at end (cache optimization)
+ENV NODE_ENV=production
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
@@ -471,19 +592,26 @@ CMD ["node", "dist/index.js"]
    find . -name "Dockerfile*" -o -name "docker-compose*.yml" -o -name "compose*.yml"
    ```
 
-2. **Run security audit first** (Critical → High → Medium)
+2. **Run Hadolint** (static analysis)
+   ```bash
+   hadolint Dockerfile
+   # Or with Docker:
+   docker run --rm -i hadolint/hadolint < Dockerfile
+   ```
 
-3. **Run optimization audit**
+3. **Run security audit** (Critical → High → Medium)
 
-4. **Scan for CVEs**
+4. **Run optimization audit**
+
+5. **Scan for CVEs**
    ```bash
    docker scout cves myapp:latest
    trivy image myapp:latest
    ```
 
-5. **Apply fixes** (with user confirmation)
+6. **Apply fixes** (with user confirmation)
 
-6. **Verify**
+7. **Verify**
    ```bash
    docker build -t audit-after .
    docker images audit-after
@@ -497,17 +625,84 @@ CMD ["node", "dist/index.js"]
 ### Security (Never Violate)
 - **NEVER** mount Docker socket
 - **NEVER** use `privileged: true`
-- **NEVER** put secrets in Dockerfile/docker-compose
+- **NEVER** put secrets in Dockerfile/docker-compose (even if "deleted" later)
 - **NEVER** run as root in production
 - **NEVER** disable seccomp/AppArmor without justification
+- **NEVER** make binaries writable by the app user
 
 ### Optimization (Best Practice)
-- **ALWAYS** pin base image versions
-- **ALWAYS** use minimal base images
-- **ALWAYS** copy dependency files before source
+- **ALWAYS** pin base image versions (digests for production)
+- **ALWAYS** use minimal base images (distroless > alpine > slim)
+- **ALWAYS** copy dependency files before source code
 - **ALWAYS** use exec form for CMD/ENTRYPOINT
 - **ALWAYS** include .dockerignore
 - **ALWAYS** use `--no-install-recommends` / `--no-cache` / `--no-cache-dir`
+- **ALWAYS** put ENV/EXPOSE at end unless needed for build
+- **ALWAYS** add OCI labels for image metadata
+
+---
+
+## Standard .dockerignore
+
+```
+# Git
+.git
+.gitignore
+
+# Dependencies (reinstalled in container)
+node_modules
+vendor
+.venv
+__pycache__
+*.pyc
+
+# Build artifacts
+dist
+build
+coverage
+.nyc_output
+
+# IDE/Editor
+.vscode
+.idea
+*.swp
+*.swo
+
+# Environment/Secrets (CRITICAL)
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+secrets/
+
+# Documentation
+*.md
+docs
+LICENSE
+
+# Tests (unless needed)
+tests
+__tests__
+*.test.js
+*.spec.js
+
+# Docker (don't include in context)
+Dockerfile*
+docker-compose*
+.dockerignore
+
+# CI/CD
+.github
+.gitlab-ci.yml
+.circleci
+
+# Backups and temp files
+*.bak
+*.tmp
+*.log
+*~
+```
 
 ---
 
@@ -521,3 +716,12 @@ CMD ["node", "dist/index.js"]
 | Rust | < 20MB | distroless/cc |
 | Java | < 300MB | eclipse-temurin:XX-jre-alpine |
 | Bun | < 200MB | oven/bun:XX-slim |
+
+---
+
+## References
+
+- [Sysdig: Top 20 Dockerfile Best Practices](https://www.sysdig.com/learn-cloud-native/dockerfile-best-practices)
+- [Atlassian: Common Dockerfile Mistakes](https://www.atlassian.com/blog/developer/common-dockerfile-mistakes)
+- [CodePathfinder: Docker Compose Security Rules](https://codepathfinder.dev/blog/announcing-docker-compose-security-rules)
+- [Hadolint: Dockerfile Linter](https://github.com/hadolint/hadolint)
